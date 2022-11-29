@@ -1,0 +1,22 @@
+*.log
+*.csv
+
+# MacOS FS
+.DS_Store
+
+# VSCode
+**/.vscode
+
+# Python
+**/__pycache__/
+*.py[cod]
+# local Python3 virtual env. directories
+**/venv/
+.python-version
+**/dist/
+**/build/
+**/*.egg-info
+
+# Maven
+**/dependency-reduced-pom.xml
+**/deps.txt
