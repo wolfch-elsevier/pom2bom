@@ -12,11 +12,15 @@ import logging
 import os
 import re
 import xml.etree.cElementTree as ET
+
+# import lxml.etree as ET
 from collections import OrderedDict
 from xml.dom import Node, minidom
-from xml.etree.ElementTree import ParseError
+
+# from xml.etree.ElementTree import ParseError
 
 from packaging.version import parse as parse_version
+from packaging.version import InvalidVersion
 
 logging.basicConfig(
     level=logging.INFO,
@@ -27,44 +31,49 @@ log = logging.getLogger("pom2bom")
 
 MVN_NS = "http://maven.apache.org/POM/4.0.0"
 # XML namespace map for ElementTree
-ns = {"mvn": MVN_NS}
+NS_MAP = {"mvn": MVN_NS}
+SAFE_TEXT = lambda elem: elem.text.strip() if elem.text else ""
+INTERPOLATE_PAT = re.compile(r"\$\{([\w.-]+)\}")
 
 
 class POMScanner:
-    INTERPOLATE_PAT = re.compile(r"\$\{([\w.-]+)\}")
-
     def __init__(self, pom_path) -> None:
-        tree = ET.parse(pom_path)
-        self.project = tree.getroot()
+        self.tree = ET.parse(pom_path)
+        self.project = self.tree.getroot()
         # self.versionprop = {}
         self.dependency_groups = {}
         self.non_version_props = {}
         self.version_props = {}
-        self.scan_for_dependencies()
+        # self.scan_for_dependencies()
 
     def scan_for_version_properties(self):
-        properties = self.project.find("mvn:properties", ns)
+        properties = self.project.find("mvn:properties", NS_MAP)
         if not properties:
             return
         for property in properties:
             local_tag = localname(property.tag)
             if local_tag.lower().find("version") > -1:
-                self.version_props[local_tag] = property.text.strip()
+                if property.text:
+                    self.version_props[local_tag] = SAFE_TEXT(property)
             else:
-                self.non_version_props[local_tag] = property.text.strip()
+                if property.text:
+                    self.non_version_props[local_tag] = SAFE_TEXT(property)
 
-    def scan_for_dependencies(self):
+    def scan_for_dependencies(self, project_properties: dict):
         """This routine can be called separately just for getting a dependency list from a POM"""
         self.scan_for_version_properties()
         for dependency in self.project.iter("{" + MVN_NS + "}dependency"):
             record = {}
             for elem in dependency:
                 field_name = localname(elem.tag)
-                record[field_name] = (
-                    self.render_version(elem.text.strip())
-                    if field_name == "version"
-                    else elem.text.strip()
-                )
+                if elem.text.strip().startswith("${"):
+                    field_value = interpolate_value(
+                        self.version_props, elem.text.strip()
+                    )
+                    field_value = interpolate_value(project_properties, field_value)
+                else:
+                    field_value = elem.text.strip()
+                record[field_name] = field_value
             if record["groupId"] not in self.dependency_groups:
                 self.dependency_groups[record["groupId"]] = {}
 
@@ -72,6 +81,7 @@ class POMScanner:
                 record["version"] if "version" in record else None
             )
 
+    """
     def render_version(self, version_str):
         try:
             version_mo = self.INTERPOLATE_PAT.match(version_str)
@@ -81,6 +91,17 @@ class POMScanner:
             return version_str_out
         except KeyError:
             return version_str
+    """
+
+
+def interpolate_value(values_map: dict, value_str: str) -> str:
+    """If value_str is '${something}' use 'something' to lookup in value_map"""
+    try:
+        value_mo = INTERPOLATE_PAT.match(value_str)
+        value_str_out = values_map[value_mo[1]] if value_mo else value_str
+        return value_str_out
+    except KeyError:
+        return value_str
 
 
 def localname(tag_name):
@@ -135,8 +156,11 @@ def strip_pom_file(input_pom_path, output_pom_path, properties_to_strip):
         elem.writexml(fh)
 
 
-def update_dependencies(current_dependencies, new_dependencies, module_name):
+def update_dependencies(
+    project_properties, current_dependencies, new_dependencies, module_name
+):
     for group_id in new_dependencies.keys():
+        group_id = interpolate_value(project_properties, group_id)
         if group_id not in current_dependencies:
             current_dependencies[group_id] = new_dependencies[group_id]
             log.info("%s: Found new dependency group %s", module_name, group_id)
@@ -164,25 +188,33 @@ def update_dependencies(current_dependencies, new_dependencies, module_name):
                 )
                 current_dependencies[group_id][artifact] = artifact_version
                 continue
-            # replace if higher version of same dependency found...
-            if parse_version(artifact_version) > parse_version(
-                current_dependencies[group_id][artifact]
-            ):
-                log.info(
-                    "%s: %s:%s - replaced version %s with %s",
-                    module_name,
+            try:
+                # replace if higher version of same dependency found...
+                if parse_version(artifact_version) > parse_version(
+                    current_dependencies[group_id][artifact]
+                ):
+                    log.info(
+                        "%s: %s:%s - replaced version %s with %s",
+                        module_name,
+                        group_id,
+                        artifact,
+                        current_dependencies[group_id][artifact],
+                        artifact_version,
+                    )
+                    current_dependencies[group_id][artifact] = artifact_version
+            except InvalidVersion as e:
+                log.warning(
+                    "Not replacing incomparable version, %s for %s:%s",
+                    artifact_version,
                     group_id,
                     artifact,
-                    current_dependencies[group_id][artifact],
-                    artifact_version,
                 )
-                current_dependencies[group_id][artifact] = artifact_version
 
 
 def insert_bom_into_parent_pom(base_dir, parent_pom_doc, properties, dependencies):
     """Adds "<dependencyManagement/>" section to parent POM"""
     root = parent_pom_doc.getroot()
-    properties_element = root.find(".//mvn:properties", ns)
+    properties_element = root.find(".//mvn:properties", NS_MAP)
     for key in sorted(list(properties)):
         ET.SubElement(properties_element, key).text = properties[key]
 
@@ -208,6 +240,7 @@ def insert_bom_into_parent_pom(base_dir, parent_pom_doc, properties, dependencie
         ]
 
     root.insert(child_count, dm_element)
+    ET.indent(parent_pom_doc, "  ")
     parent_pom_doc.write(
         os.path.join(base_dir, "pom_new.xml"), encoding="UTF-8", xml_declaration=False
     )
@@ -219,17 +252,31 @@ def scan_and_create_bom(base_dir):
     dependencies = {}
 
     ET.register_namespace("", MVN_NS)  # set default namespace
-    parent_pom_doc = ET.parse(os.path.join(base_dir, "pom.xml"))
-    root = parent_pom_doc.getroot()
 
-    mvn_modules = root.findall(".//mvn:module", ns)
+    pomscanner = POMScanner(os.path.join(base_dir, "pom.xml"))
+    parent_pom_doc = pomscanner.tree
+    project = pomscanner.project
+
+    project_groupid = project.find("mvn:groupId", NS_MAP)
+    if project_groupid is not None:
+        properties["project.groupId"] = SAFE_TEXT(project_groupid)
+
+    project_version = project.find("mvn:version", NS_MAP)
+    if project_version is not None:
+        properties["project.version"] = SAFE_TEXT(project_version)
+
+    pomscanner.scan_for_version_properties()
+    properties.update(pomscanner.version_props)
+
+    mvn_modules = project.findall(".//mvn:module", NS_MAP)
     for mvn_module in mvn_modules:
         mvn_module_pom = os.path.join(base_dir, mvn_module.text, "pom.xml")
         if os.path.exists(mvn_module_pom):
             new_mvn_module_pom = os.path.join(base_dir, mvn_module.text, "pom_new.xml")
             pomscanner = POMScanner(mvn_module_pom)
+            pomscanner.scan_for_dependencies(properties)
             update_dependencies(
-                dependencies, pomscanner.dependency_groups, mvn_module.text
+                properties, dependencies, pomscanner.dependency_groups, mvn_module.text
             )
             properties.update(pomscanner.version_props)
             properties_to_strip = {}
@@ -241,7 +288,7 @@ def scan_and_create_bom(base_dir):
 
 
 if __name__ == "__main__":
-    BASEDIR = "/Users/ma-wolf2/src6/Search"
+    BASEDIR = "/Users/wolf2/src6/Search"
 
     scan_and_create_bom(BASEDIR)
 
